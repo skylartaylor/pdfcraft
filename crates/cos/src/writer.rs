@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 
 use crate::CosError;
-use crate::document::Document;
+use crate::document::{Document, ObjectReader};
 use crate::object::{Dict, ObjRef, Object, PdfString, Stream};
 
 /// Serialize one object. Deterministic: same object → same bytes.
@@ -294,7 +294,7 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
         if in_stream {
             packed.push((num, *r));
         } else {
-            let o = renumber(&reader.get(*r), &map);
+            let o = renumber(&*reread(&mut reader, *r, *is_stream)?, &map);
             rows.insert(num, Row::InFile(out.len() as u64, 0));
             write_indirect(num, 0, &prepared(&reader.document, r.num, num, 0, &o), &mut out);
         }
@@ -305,7 +305,7 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     let mut batch = ObjectStreamBatch::default();
     for (num, reference) in packed {
         let mut encoded = Vec::new();
-        serialize(&renumber(&reader.get(reference), &map), &mut encoded);
+        serialize(&renumber(&*reread(&mut reader, reference, false)?, &map), &mut encoded);
         if batch.count > 0 && batch.body.len().saturating_add(encoded.len()).saturating_add(1) > OBJSTM_BYTES {
             batch.flush(&reader.document, &mut next, &mut rows, &mut out)?;
         }
@@ -351,6 +351,17 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     // kept as a document's working bytes for as long as it's open: drop the unused capacity.
     out.shrink_to_fit();
     Ok(out)
+}
+
+/// Object `r` read again for writing. The traversal read it once and only kept its number, so
+/// a second read that fails, finds nothing or finds a different kind of object must fail the
+/// save rather than write `null` in its place.
+fn reread(reader: &mut ObjectReader, r: ObjRef, is_stream: bool) -> Result<std::sync::Arc<Object>, CosError> {
+    let o = reader.try_get(r)?;
+    if matches!(*o, Object::Null) || matches!(*o, Object::Stream(_)) != is_stream {
+        return Err(CosError::Syntax { offset: 0, detail: format!("object {} read differently while saving; nothing was written", r.num) });
+    }
+    Ok(o)
 }
 
 #[derive(Default)]
@@ -554,6 +565,16 @@ mod tests {
         let mut out = Vec::new();
         serialize(o, &mut out);
         Lexer::new(&out, 0).object().expect("parses")
+    }
+
+    #[test]
+    fn a_second_read_that_differs_fails_the_save_instead_of_writing_null() {
+        let mut doc = Document::new_empty();
+        let dict = doc.add(Object::Dict(Dict::new()));
+        let mut reader = doc.object_reader();
+        assert!(reread(&mut reader, dict, false).is_ok());
+        assert!(reread(&mut reader, dict, true).is_err(), "a dictionary where a stream was traversed");
+        assert!(reread(&mut reader, ObjRef::new(9999, 0), false).is_err(), "nothing where an object was traversed");
     }
 
     #[test]
