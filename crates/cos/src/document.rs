@@ -128,7 +128,8 @@ pub struct Document {
 }
 
 /// A temporary reader for whole-document work. Its caches never populate the editor or
-/// undo snapshots. Returned objects own their data and survive cache eviction.
+/// undo snapshots. Returned objects survive cache eviction; a stream read from the file is a
+/// view into the input bytes (it keeps the whole input alive while held, not a copy).
 pub(crate) struct ObjectReader {
     pub(crate) document: Document,
     decoded_count: usize,
@@ -165,15 +166,38 @@ impl ObjectReader {
                 self.decoded_count = streams.len();
             }
         }
-        // Keep the cache during nested loads (indirect /Length and object-stream decoding),
-        // then release all parsed payloads. The returned Arc owns its data. Whole-document
-        // work seldom revisits parsed objects; useful compressed-object locality lives in
-        // the separately bounded decoded-stream cache above. Clear even after a failed load:
-        // resolving its /Length may have cached large streams or other objects.
+        // Parsed objects stay cached (an indirect /Length or a dictionary read again costs a
+        // lookup, not a parse) until the cache passes its object count or holds more than
+        // STREAM_BYTES of data of its own. Streams read from the file are views into the
+        // input bytes, which the document keeps anyway, so they don't count; decrypted
+        // streams and strings do. Checked after failed loads too: resolving a /Length may
+        // have cached large objects.
         if let Ok(mut cache) = self.document.cache.lock() {
-            cache.clear();
+            let data = &self.document.data;
+            if cache.len() >= Self::OBJECTS || cache.values().fold(0usize, |n, o| n.saturating_add(owned_bytes(o, data, 0))) > Self::STREAM_BYTES {
+                cache.clear();
+            }
         }
         object
+    }
+}
+
+/// Bytes `object` holds of its own: string and stream data that is not a view into `data`
+/// (the input file), nested a few levels deep (deeper data is rare and still bounded by the
+/// reader's object count).
+fn owned_bytes(object: &Object, data: &Arc<Vec<u8>>, depth: usize) -> usize {
+    if depth > 4 {
+        return 0;
+    }
+    match object {
+        Object::String(s) => s.bytes.len(),
+        Object::Stream(s) => {
+            let own = if s.raw.shares(data) { 0 } else { s.raw.len() };
+            s.dict.iter().fold(own, |n, (_, v)| n.saturating_add(owned_bytes(v, data, depth + 1)))
+        }
+        Object::Array(a) => a.iter().fold(0usize, |n, v| n.saturating_add(owned_bytes(v, data, depth + 1))),
+        Object::Dict(d) => d.iter().fold(0usize, |n, (_, v)| n.saturating_add(owned_bytes(v, data, depth + 1))),
+        _ => 0,
     }
 }
 
@@ -1257,19 +1281,25 @@ mod tests {
     }
 
     #[test]
-    fn temporary_reader_prunes_raw_streams_loaded_by_failed_length_resolution() {
-        // Reading the invalid /Length object caches a large stream even though the outer
-        // stream is malformed and returns Null. Eviction must inspect nested loads too.
+    fn temporary_reader_keeps_file_views_and_evicts_data_of_its_own() {
+        // A stream read from the file is a view into the input: caching it costs no copy, so
+        // even a large one stays cached (its /Length object too) instead of being re-parsed.
         let body = "x".repeat(ObjectReader::STREAM_BYTES + 1);
-        let stream = format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len());
-        let bytes = build(
-            &["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", &stream, "<< /Length 3 0 R >>\nstream\nbroken"],
-            "/Root 1 0 R",
-        );
+        let stream = format!("<< /Length 4 0 R >>\nstream\n{body}\nendstream");
+        let length = body.len().to_string();
+        let bytes = build(&["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", &stream, &length], "/Root 1 0 R");
         let doc = Document::open(Arc::new(bytes)).unwrap();
         let mut reader = doc.object_reader();
-        assert_eq!(*reader.get(ObjRef::new(4, 0)), Object::Null);
-        assert!(reader.document.cache.lock().unwrap().is_empty(), "failed loads still obey the raw-stream budget");
+        let read = reader.get(ObjRef::new(3, 0));
+        let Object::Stream(s) = &*read else { panic!("stream") };
+        assert!(s.raw.shares(&reader.document.data), "no copy of the file's bytes");
+        assert!(reader.document.cache.lock().unwrap().contains_key(&3), "a view costs nothing to keep");
+        // Data of its own (decrypted streams, strings) counts: past the budget the cache is
+        // cleared after the next read, including a failed one.
+        let owned = Object::Stream(crate::Stream::from_raw(Dict::new(), vec![b'y'; ObjectReader::STREAM_BYTES + 1]));
+        reader.document.cache.lock().unwrap().insert(3, Arc::new(owned));
+        assert_eq!(*reader.get(ObjRef::new(99, 0)), Object::Null);
+        assert!(reader.document.cache.lock().unwrap().is_empty(), "owned data over budget is evicted");
     }
 
     #[test]
