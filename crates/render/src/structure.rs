@@ -49,7 +49,9 @@ pub(crate) trait Structure {
             let Ok(dict) = self.get_dictionary(id) else { continue };
             match dict.get_type() {
                 Ok(b"Page") => {
-                    pages.insert(pages.len() as u32 + 1, id);
+                    // Page numbers are 1-based u32s; a tree past u32::MAX pages stops there.
+                    let Some(number) = u32::try_from(pages.len()).ok().and_then(|n| n.checked_add(1)) else { return pages };
+                    pages.insert(number, id);
                 }
                 Ok(b"Pages") => {
                     if let Ok(kids) = dict.get(b"Kids").and_then(|o| self.dereference(o)).and_then(|(_, o)| o.as_array()) {
