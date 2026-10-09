@@ -1258,10 +1258,19 @@ trailer << /Root 1 0 R >>
 
     #[test]
     fn lazy_structure_matches_the_compatibility_inspector() {
-        for bytes in [ATTACHMENTS, LAYERS] {
+        // Each fixture as lopdf writes it, and with its objects in object streams.
+        let packed = |bytes: &[u8]| {
+            let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).unwrap();
+            pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { object_streams: true, ..Default::default() }).unwrap()
+        };
+        let fixtures = [ATTACHMENTS, LAYERS, DESTS].into_iter().flat_map(|bytes| {
             let mut original = Document::load_mem(bytes).unwrap();
-            let mut bytes = Vec::new();
-            original.save_to(&mut bytes).unwrap();
+            let mut plain = Vec::new();
+            original.save_to(&mut plain).unwrap();
+            let stm = packed(&plain);
+            [plain, stm]
+        });
+        for bytes in fixtures {
             let lazy = LazyStructure::new(Arc::new(bytes.clone()), None).unwrap();
             let eager = Document::load_mem(&bytes).unwrap();
             let mut a = inspect(Arc::new(bytes), None).unwrap();
