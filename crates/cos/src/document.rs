@@ -12,9 +12,6 @@ use crate::CosError;
 use crate::object::{Dict, ObjRef, Object};
 use crate::parser::{Lexer, is_whitespace, parse_indirect, parse_indirect_shared};
 
-#[cfg(test)]
-pub(crate) mod cache_probe;
-
 thread_local! {
     /// The objects being loaded on this thread, innermost last (see `Document::try_get`).
     static LOADING: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -146,10 +143,6 @@ impl ObjectReader {
     }
 
     pub(crate) fn try_get(&mut self, reference: ObjRef) -> Result<Arc<Object>, CosError> {
-        #[cfg(test)]
-        if let Some(result) = cache_probe::read(self, reference) {
-            return result;
-        }
         let object = self.document.try_get(reference.num);
         if let Ok(mut streams) = self.document.objstms.lock() {
             // Only insertion changes this private cache between reads. Most neighboring
@@ -633,8 +626,6 @@ impl Document {
     }
 
     fn load(&self, num: u32, depth: u32) -> Result<Object, CosError> {
-        #[cfg(test)]
-        cache_probe::load();
         if depth > 16 {
             return Err(CosError::Syntax { offset: 0, detail: "reference cycle while loading".into() });
         }
@@ -677,12 +668,8 @@ impl Document {
 
     fn objstm(&self, num: u32) -> Result<Arc<ObjStm>, CosError> {
         if let Some(s) = self.objstms.lock().map_err(|_| CosError::Poisoned)?.get(&num) {
-            #[cfg(test)]
-            cache_probe::stream_access(num, true);
             return Ok(s.clone());
         }
-        #[cfg(test)]
-        cache_probe::stream_access(num, false);
         let Object::Stream(s) = &*self.try_get(num)? else { return Err(CosError::MissingObject(num)) };
         let n = s.dict.int(b"N").unwrap_or(0).clamp(0, 1_000_000) as usize;
         let first = s.dict.int(b"First").unwrap_or(0).max(0) as usize;
@@ -694,8 +681,6 @@ impl Document {
             index.push((onum.max(0) as u32, first + off.max(0) as usize));
         }
         let stm = Arc::new(ObjStm { index, data: Arc::new(data) });
-        #[cfg(test)]
-        cache_probe::decoded(&stm);
         self.objstms.lock().map_err(|_| CosError::Poisoned)?.insert(num, stm.clone());
         Ok(stm)
     }

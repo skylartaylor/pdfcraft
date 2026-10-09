@@ -251,8 +251,6 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
             queue.push_back(r);
         }
     }
-    #[cfg(test)]
-    crate::document::cache_probe::phase("traversal");
     while let Some(r) = queue.pop_front() {
         if map.contains_key(&r) {
             continue;
@@ -273,8 +271,6 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     out.extend_from_slice(&[b'%', 0xE2, 0xE3, 0xCF, 0xD3, b'\n']);
     // The /Encrypt dictionary and everything it references (e.g. indirect /CF crypt-filter
     // dictionaries) are needed before anything can be decrypted: never inside object streams.
-    #[cfg(test)]
-    crate::document::cache_probe::phase("encryption_dependencies");
     let mut encryption_objects: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
     let mut pending: Vec<ObjRef> = trailer_in.reference(b"Encrypt").into_iter().collect();
     while let Some(r) = pending.pop() {
@@ -286,8 +282,6 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     // Keep only references, not renamed copies of the entire object graph. Standalone
     // objects still precede object streams, preserving the established output order.
     let mut packed: Vec<(u32, ObjRef)> = Vec::new();
-    #[cfg(test)]
-    crate::document::cache_probe::phase("standalone");
     for (i, (r, is_stream)) in order.iter().enumerate() {
         let num = output_number(i)?;
         let in_stream = opts.object_streams && !is_stream && !encryption_objects.contains(r);
@@ -303,8 +297,6 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     // individually: the whole stream is (§7.5.7, §7.6.2).
     let mut next = output_number(order.len())?;
     let mut batch = ObjectStreamBatch::default();
-    #[cfg(test)]
-    crate::document::cache_probe::phase("packed");
     for (num, reference) in packed {
         let mut encoded = Vec::new();
         serialize(&renumber(&reader.get(reference), &map), &mut encoded);
