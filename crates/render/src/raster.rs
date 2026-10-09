@@ -1365,7 +1365,7 @@ trailer << /Root 1 0 R >>
                 let (a, b) = (small.render(req), large.render(req));
                 assert!(a.error.is_none() && b.error.is_none());
                 assert_eq!((a.width, a.height, &a.rgba), (b.width, b.height, &b.rgba));
-                assert!(b.rgba.chunks_exact(4).any(|p| p == [0, 0, 255, 255]));
+                assert!(b.rgba.as_chunks::<4>().0.iter().any(|p| *p == [0, 0, 255, 255]));
             }
             let req = RenderRequest { page, kind: RequestKind::Text, ..Default::default() };
             let (a, b) = (small.render(req), large.render(req));

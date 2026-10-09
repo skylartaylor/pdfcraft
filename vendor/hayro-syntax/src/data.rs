@@ -94,7 +94,8 @@ impl Data {
 
     /// Get access to the data of a decoded object stream.
     pub(crate) fn get_with(&self, id: ObjectIdentifier, ctx: &ReaderContext<'_>) -> Option<&[u8]> {
-        // Register exactly once: racing misses must not allocate different slots
+        // PdfCraft patch: (#307, see vendor/README.md hayro-syntax (7)) register exactly once:
+        // racing misses must not allocate different slots
         // for the same id (or reuse the resulting hole for another stream).
         let idx = {
             let mut map = self.map.get();
@@ -116,7 +117,7 @@ impl Data {
     }
 }
 
-/// One cold initializer at a time prevents cross-thread dependency deadlocks.
+/// PdfCraft patch: (#307) one cold initializer at a time prevents cross-thread dependency deadlocks.
 /// The owner may recursively load different streams, up to a fixed depth. No
 /// state mutex is held while parsing or decoding input. no_std is single-threaded
 /// (its Arc/locks are Rc/RefCell), so it needs the same cycle/depth checks only.
