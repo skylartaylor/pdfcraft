@@ -21,6 +21,9 @@
 	Name on new comments	Имя в новых комментариях
 	Open…	Открыть…
 	Open Recent	Открыть недавние
+	Clear Recent Files	Очистить недавние файлы
+	Remove from Recent	Убрать из недавних
+	Remove {name} from Recent	Убрать {name} из недавних
 	Pin folder to Home…	Закрепить папку на главной…
 	Folders	Папки
 	Pin a folder…	Закрепить папку…
@@ -594,6 +597,7 @@
 	Bottom:	Снизу:
 	Width:	Ширина:
 	Height:	Высота:
+	Rotation:	Поворот:
 	Points from the page's bottom-left corner.	Точки от левого нижнего угла страницы.
 	Alignment:	Выравнивание:
 	Default Value:	Значение по умолчанию:
@@ -912,6 +916,7 @@
 	This comment's appearance can't be changed yet.	Внешний вид этого комментария пока нельзя изменить.
 	Icon	Значок
 	Thickness	Толщина
+	Line ending	Окончание линии
 	Modified	Изменено
 	No status has been set.	Статус не установлен.
 	Compare Files	Сравнить файлы
@@ -1972,6 +1977,7 @@
 	Default page display	Отображение страниц по умолчанию
 	Default zoom	Масштаб по умолчанию
 	Used when a PDF doesn't ask for a layout or zoom. Continuous scrolling never snaps between pages.	Используется, когда PDF не запрашивает макет или масштаб. Непрерывная прокрутка никогда не привязывается между страницами.
+	Reopen the files that were open when PdfCraft last closed	Повторно открывать файлы, которые были открыты при последнем закрытии PdfCraft
 	Choose a PNG or JPEG image (up to 4 MiB). Transparency is preserved.	Выберите изображение PNG или JPEG (до 4 МиБ). Прозрачность сохраняется.
 	Couldn't import the signature image: {e}	Не удалось импортировать изображение подписи: {e}
 
@@ -1994,3 +2000,4 @@
 	Created a PDF from {n} files; left out: {names}	PDF создан из файлов: {n}; пропущены: {names}
 	Created a PDF from the first {n} files	PDF создан из первых файлов: {n}
 	Go to page…	Перейти на страницу…
+	The standard fonts can't draw “{c}” ({code}). Only Western European characters can be added as text for now.	Стандартные шрифты не могут отобразить «{c}» ({code}). Пока в виде текста можно добавлять только западноевропейские символы.

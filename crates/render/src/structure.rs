@@ -197,7 +197,7 @@ fn convert(object: &CosObject, depth: usize) -> Result<Object> {
         CosObject::Ref(value) => Object::Reference((value.num, value.generation)),
         CosObject::Array(value) => Object::Array(value.iter().map(|o| convert(o, depth + 1)).collect::<Result<_>>()?),
         CosObject::Dict(value) => Object::Dictionary(convert_dict(value, depth + 1)?),
-        CosObject::Stream(value) => Object::Stream(lopdf::Stream::new(convert_dict(&value.dict, depth + 1)?, value.raw.as_ref().clone())),
+        CosObject::Stream(value) => Object::Stream(lopdf::Stream::new(convert_dict(&value.dict, depth + 1)?, value.raw.to_vec())),
     })
 }
 

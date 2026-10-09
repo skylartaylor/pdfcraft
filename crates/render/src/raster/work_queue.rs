@@ -39,7 +39,7 @@ fn valid(token: &Option<Arc<AtomicBool>>) -> bool {
 
 #[cfg(any(test, not(target_arch = "wasm32")))]
 fn result_bytes(page: &RenderedPage) -> usize {
-    let mut bytes = std::mem::size_of::<RenderedPage>().saturating_add(page.rgba.capacity());
+    let mut bytes = std::mem::size_of::<RenderedPage>().saturating_add(page.rgba.byte_capacity());
     if let Some(error) = &page.error {
         bytes = bytes.saturating_add(error.capacity());
     }
@@ -289,13 +289,14 @@ impl Drop for ResultReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Pixels;
 
     fn req(page: usize) -> RenderRequest {
         RenderRequest { page, scale: 1.0, ..Default::default() }
     }
 
     fn page(req: RenderRequest, bytes: usize) -> RenderedPage {
-        RenderedPage { request: req, width: 1, height: 1, rgba: vec![0; bytes], error: None, text: None, millis: 0 }
+        RenderedPage { request: req, width: 1, height: 1, rgba: Pixels::from(vec![0u32; bytes / 4]), error: None, text: None, millis: 0 }
     }
 
     #[test]
