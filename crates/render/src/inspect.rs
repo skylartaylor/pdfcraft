@@ -1,8 +1,9 @@
 //! Document inspection: everything panels need that is not pixels.
 //!
 //! Page geometry comes from hayro (which resolves inheritance and rotation); the rest comes from
-//! lopdf (bootstrap, replaced by `pdfcraft-model` in M2). Inspection is *tolerant*: when lopdf
-//! cannot load a file that hayro can render, panels are simply empty and `warnings` says why.
+//! the lazy COS reader through a read-only lopdf object adapter. The original lopdf loader
+//! remains the compatibility fallback. When neither can inspect a renderable file, panels
+//! are empty and `warnings` says why.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use hayro::hayro_syntax::Pdf;
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
 
 use crate::OpenError;
+use crate::structure::{LazyStructure, Structure};
 
 /// lopdf decodes object and cross-reference streams while it loads, with no limit unless one is
 /// set: a few hundred bytes of nested FlateDecode then inflate to gigabytes. Real object and
@@ -304,14 +306,27 @@ pub fn inspect(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<DocInfo, O
         Err(p) => return Err(OpenError::Invalid(format!("the page tree could not be read: {}", crate::raster::panic_message(&p)))),
     }
     let options = load_options(password);
-    let structure = catch_unwind(AssertUnwindSafe(|| match Document::load_mem_with_options(&bytes, options) {
-        Ok(doc) => {
-            let mut tmp = DocInfo::default();
-            std::mem::swap(&mut tmp.pages, &mut info.pages);
-            Inspector::new(&doc).fill(&mut tmp);
-            Ok(tmp)
+    // Geometry no longer needs the renderer parser. Do not overlap its allocations with
+    // structural inspection, including the compatibility fallback for damaged files.
+    drop(pdf);
+    let structure = catch_unwind(AssertUnwindSafe(|| -> Result<DocInfo, String> {
+        if let Ok(doc) = LazyStructure::new(bytes.clone(), password) {
+            let mut tmp = DocInfo { pages: info.pages.clone(), ..Default::default() };
+            let inspector = Inspector::new(&doc);
+            if inspector.page_index.len() == tmp.pages.len() {
+                inspector.fill(&mut tmp);
+                if !doc.failed() {
+                    return Ok(tmp);
+                }
+            }
         }
-        Err(e) => Err(e.to_string()),
+        // Keep lopdf's existing repair/tolerance path when the lazy reader cannot expose
+        // the same page tree or an object needed by a panel. No partial result is published.
+        let doc = Document::load_mem_with_options(&bytes, options).map_err(|e| e.to_string())?;
+        let mut tmp = DocInfo::default();
+        std::mem::swap(&mut tmp.pages, &mut info.pages);
+        Inspector::new(&doc).fill(&mut tmp);
+        Ok(tmp)
     }));
     match structure {
         Ok(Ok(mut filled)) => {
@@ -331,7 +346,7 @@ pub fn inspect(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<DocInfo, O
 }
 
 struct Inspector<'a> {
-    doc: &'a Document,
+    doc: &'a dyn Structure,
     page_index: HashMap<ObjectId, usize>,
     /// Named destinations (`/Names /Dests` tree), keyed by raw string bytes, built once.
     /// Looking each name up by walking the tree was O(links × names): minutes on manuals.
@@ -339,7 +354,7 @@ struct Inspector<'a> {
 }
 
 impl<'a> Inspector<'a> {
-    fn new(doc: &'a Document) -> Self {
+    fn new(doc: &'a dyn Structure) -> Self {
         let page_index = doc.get_pages().into_iter().map(|(n, id)| (id, n as usize - 1)).collect();
         let mut me = Self { doc, page_index, named: HashMap::new() };
         let mut named = HashMap::new();
@@ -354,8 +369,8 @@ impl<'a> Inspector<'a> {
 
     fn fill(&self, info: &mut DocInfo) {
         // lopdf drops /Encrypt from the trailer once it has decrypted the file.
-        info.encrypted = self.doc.is_encrypted() || self.doc.was_encrypted() || self.doc.trailer.get(b"Encrypt").is_ok();
-        if let Some(d) = self.doc.trailer.get(b"Info").ok().and_then(|o| self.dict(o)) {
+        info.encrypted = self.doc.encrypted();
+        if let Some(d) = self.doc.trailer().get(b"Info").ok().and_then(|o| self.dict(o)) {
             info.title = self.text(d, b"Title");
             info.author = self.text(d, b"Author");
             info.subject = self.text(d, b"Subject");
@@ -1087,6 +1102,27 @@ trailer << /Root 1 0 R >>
         assert_eq!(layers, [((5, 0), "Red", true), ((6, 0), "Green", false), ((7, 0), "Blue", true)]);
         // A group of one constrains nothing; an indirect group is read.
         assert_eq!(info.layer_groups, [vec![(5, 0), (6, 0)], vec![(6, 0), (7, 0)]]);
+    }
+
+    #[test]
+    fn lazy_structure_matches_the_compatibility_inspector() {
+        for bytes in [ATTACHMENTS, LAYERS] {
+            let mut original = Document::load_mem(bytes).unwrap();
+            let mut bytes = Vec::new();
+            original.save_to(&mut bytes).unwrap();
+            let lazy = LazyStructure::new(Arc::new(bytes.clone()), None).unwrap();
+            let eager = Document::load_mem(&bytes).unwrap();
+            let mut a = inspect(Arc::new(bytes), None).unwrap();
+            let mut b = DocInfo { pages: a.pages.clone(), ..Default::default() };
+            let mut c = DocInfo { pages: a.pages.clone(), ..Default::default() };
+            Inspector::new(&lazy).fill(&mut b);
+            Inspector::new(&eager).fill(&mut c);
+            assert!(!lazy.failed());
+            assert_eq!(format!("{b:?}"), format!("{c:?}"));
+            a.file_size = 0;
+            a.pdf_version.clear();
+            assert_eq!(format!("{a:?}"), format!("{c:?}"));
+        }
     }
 
     #[test]

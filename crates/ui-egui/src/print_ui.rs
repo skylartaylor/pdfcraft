@@ -270,7 +270,7 @@ pub(crate) fn body(
     t: &Tokens,
     sizes: &[(f64, f64)],
     labels: &[String],
-    thumb: &dyn Fn(usize) -> Option<egui::TextureId>,
+    thumb: &mut dyn FnMut(usize) -> Option<egui::TextureId>,
 ) -> (bool, bool) {
     ui.set_width(820.0);
     ui.label(egui::RichText::new(tl!("Print")).font(theme::semibold(18.0)));

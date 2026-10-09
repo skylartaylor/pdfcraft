@@ -99,7 +99,7 @@ mod widgets;
 
 use pdfcraft_engine::{DocId, Session};
 
-pub use canvas::DocView;
+pub use canvas::{DocView, RasterMemory};
 pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
@@ -1664,12 +1664,6 @@ impl eframe::App for PdfCraftApp {
         self.process_file_requests();
         #[cfg(not(target_arch = "wasm32"))]
         self.process_picked();
-        // Pull finished renders into textures for every open document.
-        for view in &mut self.views {
-            if let Some(doc) = self.session.get(view.id) {
-                view.receive(ctx, &doc.renderer);
-            }
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1679,6 +1673,9 @@ impl eframe::App for PdfCraftApp {
         if !self.fonts_ready {
             ctx.request_repaint();
             return;
+        }
+        for view in &mut self.views {
+            view.begin_render_frame();
         }
         // The window shows the active document's name (or title, if it asks for that).
         let title = self
@@ -1706,6 +1703,7 @@ impl eframe::App for PdfCraftApp {
             // Notices too: a refused field value or a failed save must be seen in full screen.
             self.show_progress(&ctx);
             widgets::toast(self, &ctx);
+            self.finish_render_frame(&ctx);
             return;
         }
         chrome::tab_strip(self, ui);
@@ -1730,5 +1728,25 @@ impl eframe::App for PdfCraftApp {
         dialogs::show(self, &ctx);
         self.show_progress(&ctx);
         widgets::toast(self, &ctx);
+        self.finish_render_frame(&ctx);
+    }
+}
+
+impl PdfCraftApp {
+    fn finish_render_frame(&mut self, ctx: &egui::Context) {
+        // Retire hidden documents before admitting the visible document's textures, so the
+        // three cache limits apply to the application, regardless of how many tabs are open.
+        for (i, view) in self.views.iter_mut().enumerate() {
+            if Some(i) != self.active
+                && let Some(doc) = self.session.get(view.id)
+            {
+                view.suspend_rendering(&doc.renderer);
+            }
+        }
+        if let Some(view) = self.active.and_then(|i| self.views.get_mut(i))
+            && let Some(doc) = self.session.get(view.id)
+        {
+            view.finish_render_frame(ctx, &doc.info, &doc.renderer);
+        }
     }
 }

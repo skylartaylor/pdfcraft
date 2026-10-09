@@ -1,17 +1,24 @@
 //! Background page rasterization.
 //!
-//! A `RenderPool` owns N worker threads. Each worker parses the shared bytes once (hayro's parser
-//! is lazy, so this is cheap) and keeps its own render cache. Requests carry a caller tag that is
-//! echoed back; the UI drops results for stale tags (e.g. after a zoom change).
+//! A `RenderPool` parses lazily once and shares that immutable parser between workers. Render
+//! caches stay worker-local. Requests carry a caller tag that is echoed back.
 //!
 //! **Robustness:** every page render runs under `catch_unwind`. A panic inside the renderer on a
-//! malformed page yields a `RenderedPage` with `error` set, and the worker rebuilds its parser and
-//! cache before continuing, so one bad page can never take down the app or poison later pages.
+//! malformed page yields an error and permanently retires the pool's shared parser generation.
+//! Workers discard its caches/results and fall back to private parsers. There is no shared
+//! rebuild loop, and a timed-out shared initialization is never started again in that pool.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{Receiver, Sender, channel};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{Receiver, sync_channel};
+
+mod work_queue;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use work_queue::{ResultReceiver, WorkQueue};
 
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_interpret::font::{FontData, FontQuery};
@@ -276,70 +283,171 @@ pub(crate) fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
 /// How long one page may render before the pool gives up on it (the watchdog).
 pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BusyStage {
+    InitializingShared,
+    SharedRender,
+    /// Includes private initialization, which must not escape the watchdog.
+    Private,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct Busy {
+    request: RenderRequest,
+    since: std::time::Instant,
+    stage: BusyStage,
+}
+
 /// State shared by the pool and its workers.
 #[derive(Default)]
 struct Shared {
-    /// Pending requests, most urgent last (workers pop from the end).
-    queue: Mutex<Vec<RenderRequest>>,
-    /// Requests a worker has taken whose answer `try_recv` has not handed out yet. Callers keep
-    /// listing the requests they're still waiting for in each new queue, so a queued request
-    /// equal to one of these is dropped instead of being rendered a second time. Lock `queue`
-    /// first when holding both.
-    taken: Mutex<Vec<RenderRequest>>,
+    /// Desired requests, active jobs and bounded completed results share one deduplication key.
+    queue: Arc<WorkQueue>,
     /// Per worker id: the request it is rendering and since when.
     #[cfg(not(target_arch = "wasm32"))]
-    busy: Mutex<Vec<Option<(RenderRequest, std::time::Instant)>>>,
+    busy: Mutex<Vec<Option<Busy>>>,
     /// Pages (and request kinds) the watchdog gave up on: answered with an error at once, so a
     /// pathological page cannot trap every worker in turn.
     stuck: Mutex<std::collections::HashSet<(usize, RequestKind)>>,
     /// Test hook: make one page slow.
     #[cfg(test)]
     slow_page: Mutex<Option<(usize, std::time::Duration)>>,
+    /// Test hook: count parser initializations, including failed parses.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    parses: std::sync::atomic::AtomicUsize,
+    #[cfg(not(target_arch = "wasm32"))]
+    parser: PoolParser,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    panic_page: Mutex<Option<usize>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    slow_parse: Mutex<Option<std::time::Duration>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    render_started: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    shared_render_delay: Mutex<Option<std::time::Duration>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Whether two requests ask for the same answer (the scale compared bit for bit, so that a NaN
-/// request still matches itself and leaves `taken` when answered).
-fn same(a: &RenderRequest, b: &RenderRequest) -> bool {
-    (a.page, a.kind, a.tile, a.scale.to_bits(), a.tag) == (b.page, b.kind, b.tile, b.scale.to_bits(), b.tag)
+#[cfg(not(target_arch = "wasm32"))]
+fn set_busy_stage(shared: &Shared, id: usize, stage: BusyStage) -> bool {
+    let mut slots = lock(&shared.busy);
+    let Some(Some(busy)) = slots.get_mut(id) else { return false };
+    if busy.stage != stage {
+        busy.stage = stage;
+        busy.since = std::time::Instant::now();
+    }
+    true
 }
 
-/// Pop the most urgent queued request that isn't already taken, and mark it taken.
 #[cfg(not(target_arch = "wasm32"))]
-fn take_next(shared: &Shared) -> Option<RenderRequest> {
-    let mut queue = lock(&shared.queue);
-    let mut taken = lock(&shared.taken);
-    while let Some(req) = queue.pop() {
-        if !taken.iter().any(|t| same(t, &req)) {
-            taken.push(req);
-            return Some(req);
-        }
+#[derive(Default)]
+enum ParserState {
+    #[default]
+    Empty,
+    Loading,
+    Ready(Option<Arc<Pdf>>),
+    /// A page failed after initialization: isolate subsequent work per worker.
+    Private,
+    /// Initial parsing itself timed out. Retrying it on every worker cannot help.
+    Failed,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PoolParser {
+    state: Mutex<ParserState>,
+    ready: std::sync::Condvar,
+    valid: Arc<AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for PoolParser {
+    fn default() -> Self {
+        Self { state: Mutex::default(), ready: std::sync::Condvar::new(), valid: Arc::new(AtomicBool::new(true)) }
     }
-    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PoolParser {
+    /// `None` means use a private parser. `Some(None)` is a terminal parse failure.
+    fn acquire(&self, load: impl FnOnce() -> Option<Pdf>, cancelled: impl Fn() -> bool) -> Option<Option<Arc<Pdf>>> {
+        let mut state = lock(&self.state);
+        loop {
+            if cancelled() {
+                return Some(None);
+            }
+            match &*state {
+                ParserState::Ready(pdf) => return Some(pdf.clone()),
+                ParserState::Private => return None,
+                ParserState::Failed => return Some(None),
+                ParserState::Loading => {
+                    // Drop never joins a parser. A waiting worker must still notice
+                    // its pool's disconnected wake channel while another thread is
+                    // stuck in initialization and cannot signal this condition.
+                    state = self.ready.wait_timeout(state, std::time::Duration::from_millis(50)).unwrap_or_else(|p| p.into_inner()).0;
+                }
+                ParserState::Empty => {
+                    *state = ParserState::Loading;
+                    break;
+                }
+            }
+        }
+        drop(state);
+        // Parsing cannot hold the lifecycle mutex: watchdog/drop must remain nonblocking.
+        // Even a panic in initialization publishes one terminal failure and wakes waiters.
+        let pdf = catch_unwind(AssertUnwindSafe(load)).ok().flatten().map(Arc::new);
+        let mut state = lock(&self.state);
+        let result = match &*state {
+            ParserState::Loading => {
+                *state = ParserState::Ready(pdf.clone());
+                Some(pdf)
+            }
+            ParserState::Private => None,
+            _ => Some(None), // the watchdog retired initialization while it ran
+        };
+        self.ready.notify_all();
+        result
+    }
+
+    fn abandon(&self) {
+        self.retire(false);
+    }
+
+    fn retire(&self, initialization_failed: bool) {
+        let mut state = lock(&self.state);
+        self.valid.store(false, Ordering::Release);
+        *state = match &*state {
+            _ if initialization_failed => ParserState::Failed,
+            ParserState::Loading | ParserState::Empty | ParserState::Failed => ParserState::Failed,
+            _ => ParserState::Private,
+        };
+        self.ready.notify_all();
+    }
 }
 
 /// Renders pages on worker threads, most urgent request first.
 ///
-/// **Watchdog:** a render running longer than `stuck_after` (default [`STUCK_AFTER`]) is reported
-/// as an error for that page, the page is not attempted again, and a replacement worker takes
-/// the stuck one's place (threads cannot be killed; the stuck one exits when its render
-/// finally returns, and its late result is dropped). At most `threads` replacements are started
-/// per pool, so a document full of pathological pages cannot spawn threads without bound.
+/// **Watchdog:** a timed-out shared render retires that parser and retries still-desired work
+/// privately: the page may only have been waiting behind another page's decode. A private
+/// timeout is reported and skipped. Shared initialization timeout is terminal for the pool.
+/// Threads cannot be killed; abandoned workers exit when their current work returns. At most
+/// `threads` replacements are started per pool. If every worker is retired after that budget
+/// is spent, pending and future requests fail explicitly instead of waiting forever.
 pub struct RenderPool {
     shared: Arc<Shared>,
-    wake: Mutex<Vec<Sender<()>>>,
-    results: Receiver<RenderedPage>,
-    results_tx: Sender<RenderedPage>,
+    wake: Mutex<Vec<SyncSender<()>>>,
+    results: ResultReceiver,
+    results_tx: Arc<WorkQueue>,
     bytes: Arc<Vec<u8>>,
     config: RenderConfig,
     _workers: Mutex<Vec<JoinHandle<()>>>,
-    /// Errors produced by the watchdog, handed out by `try_recv`.
-    abandoned: Mutex<Vec<RenderedPage>>,
     stuck_after: std::time::Duration,
     replacements_left: Mutex<usize>,
+    retired_workers: Mutex<usize>,
     /// Used when threads are unavailable (wasm32 without atomics, or spawn failure): requests are
     /// rendered on the calling thread inside `try_recv`, one per call.
     inline: Option<std::cell::RefCell<PageRenderer>>,
@@ -347,19 +455,25 @@ pub struct RenderPool {
 
 impl RenderPool {
     pub fn new(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig) -> Self {
-        let (results_tx, results) = channel();
-        let threads = if cfg!(target_arch = "wasm32") { 0 } else { threads.max(1) };
+        Self::with_mode(bytes, threads, config, false)
+    }
+
+    fn with_mode(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig, inline: bool) -> Self {
+        let threads = if inline || cfg!(target_arch = "wasm32") { 0 } else { threads.max(1) };
+        let shared = Arc::new(Shared::default());
+        let results_tx = shared.queue.clone();
+        let results = ResultReceiver(shared.queue.clone());
         let mut pool = Self {
-            shared: Arc::default(),
+            shared,
             wake: Mutex::new(Vec::new()),
             results,
             results_tx,
             bytes: bytes.clone(),
             config: config.clone(),
             _workers: Mutex::new(Vec::new()),
-            abandoned: Mutex::new(Vec::new()),
             stuck_after: STUCK_AFTER,
             replacements_left: Mutex::new(threads),
+            retired_workers: Mutex::new(0),
             inline: None,
         };
         for _ in 0..threads {
@@ -382,7 +496,7 @@ impl RenderPool {
                 busy.push(None);
                 busy.len() - 1
             };
-            let (wtx, wrx) = channel::<()>();
+            let (wtx, wrx) = sync_channel::<()>(1);
             let (shared, out, bytes, config) = (self.shared.clone(), self.results_tx.clone(), self.bytes.clone(), self.config.clone());
             match std::thread::Builder::new().name(format!("pdfcraft-render-{id}")).spawn(move || worker(id, bytes, config, shared, wrx, out)) {
                 Ok(h) => {
@@ -400,13 +514,7 @@ impl RenderPool {
 
     /// A pool without worker threads: renders inside `try_recv` (the web path; also used in tests).
     pub fn new_inline(bytes: Arc<Vec<u8>>, config: RenderConfig) -> Self {
-        let mut pool = Self::new(bytes.clone(), 0, config.clone());
-        if pool.inline.is_none() {
-            // Native `new` always spawns at least one worker; drop to inline explicitly.
-            pool = Self { shared: Arc::default(), wake: Mutex::new(Vec::new()), _workers: Mutex::new(Vec::new()), ..pool };
-            pool.inline = Some(std::cell::RefCell::new(PageRenderer::new(bytes, config)));
-        }
-        pool
+        Self::with_mode(bytes, 0, config, true)
     }
 
     /// `true` when rendering happens on the caller's thread (no worker threads available).
@@ -419,32 +527,51 @@ impl RenderPool {
         self.stuck_after = limit;
     }
 
-    /// Replace the pending queue (most urgent first). In-flight renders are not interrupted, and a
-    /// request equal to one already taken (rendering, or answered but not yet received through
-    /// `try_recv`) is skipped rather than rendered twice.
-    pub fn set_queue(&self, mut requests: Vec<RenderRequest>) {
-        requests.reverse(); // workers pop from the end
-        *lock(&self.shared.queue) = requests;
+    /// Replace desired work (most urgent first), retaining matching in-flight/completed jobs.
+    /// Obsolete results are released before they reach the caller. In-flight work is not killed.
+    pub fn set_queue(&self, requests: Vec<RenderRequest>) {
+        self.shared.queue.replace(requests);
+        self.wake_workers();
+    }
+
+    fn wake_workers(&self) {
         for w in lock(&self.wake).iter() {
-            let _ = w.send(());
+            // One pending wakeup is sufficient; UI polling must not grow wake channels.
+            let _ = w.try_send(());
         }
     }
 
     pub fn try_recv(&self) -> Option<RenderedPage> {
         if let Some(r) = &self.inline {
-            let next = lock(&self.shared.queue).pop();
-            return next.map(|req| r.borrow_mut().render(req));
+            let req = self.shared.queue.pop()?;
+            let page = r.borrow_mut().render(req);
+            self.shared.queue.finish_inline(req);
+            return Some(page);
         }
         self.watchdog();
-        let page = lock(&self.abandoned).pop().or_else(|| self.results.try_recv().ok())?;
-        // Copies of the request queued while it rendered are answered too.
-        let mut queue = lock(&self.shared.queue);
-        queue.retain(|q| !same(q, &page.request));
-        let mut taken = lock(&self.shared.taken);
-        if let Some(i) = taken.iter().position(|t| same(t, &page.request)) {
-            taken.swap_remove(i);
-        }
-        Some(page)
+        let page = self.results.try_recv().ok();
+        // Consuming a result releases byte/count capacity. An invalid parser generation
+        // can also requeue work without returning a page, so wake in both cases.
+        self.wake_workers();
+        page.or_else(|| {
+            let workers = lock(&self._workers).len();
+            if workers == 0 || *lock(&self.retired_workers) < workers {
+                return None;
+            }
+            // Count successful handles, not reserved busy slots: thread spawning
+            // can fail. No worker remains able to service these pending requests.
+            let request = self.shared.queue.pop()?;
+            self.shared.queue.finish_inline(request);
+            Some(RenderedPage {
+                request,
+                width: 0,
+                height: 0,
+                rgba: Vec::new(),
+                error: Some("all render workers exceeded their time limits; close and reopen the document to try again".into()),
+                text: None,
+                millis: 0,
+            })
+        })
     }
 
     /// Give up on renders that exceeded `stuck_after` (see the type docs).
@@ -455,31 +582,41 @@ impl RenderPool {
             {
                 let mut busy = lock(&self.shared.busy);
                 for slot in busy.iter_mut() {
-                    if let Some((req, since)) = *slot
-                        && since.elapsed() > self.stuck_after
+                    if let Some(busy) = *slot
+                        && busy.since.elapsed() > self.stuck_after
                     {
                         *slot = None; // the worker sees this and exits when it returns
-                        gave_up.push(req);
+                        gave_up.push(busy);
                     }
                 }
             }
-            for req in gave_up {
-                lock(&self.shared.stuck).insert((req.page, req.kind));
-                let what = if req.kind == RequestKind::Text { "text extraction for page" } else { "page" };
-                let error = format!(
-                    "{what} {} took longer than {:.0} s and was skipped; the page may be damaged or extremely complex",
-                    req.page + 1,
-                    self.stuck_after.as_secs_f32().max(1.0)
-                );
-                lock(&self.abandoned).push(RenderedPage {
-                    request: req,
-                    width: 0,
-                    height: 0,
-                    rgba: Vec::new(),
-                    error: Some(error),
-                    text: None,
-                    millis: 0,
-                });
+            *lock(&self.retired_workers) += gave_up.len();
+            for busy in gave_up {
+                let req = busy.request;
+                self.shared.parser.retire(busy.stage == BusyStage::InitializingShared);
+                if busy.stage == BusyStage::SharedRender {
+                    // The shared cold-decode gate can make a healthy page wait
+                    // behind another page. Only its private retry can attribute
+                    // the timeout to this page; do not blacklist it here.
+                    self.shared.queue.retry(req);
+                } else {
+                    lock(&self.shared.stuck).insert((req.page, req.kind));
+                    let what = if req.kind == RequestKind::Text { "text extraction for page" } else { "page" };
+                    let error = format!(
+                        "{what} {} took longer than {:.0} s and was skipped; the page may be damaged or extremely complex",
+                        req.page + 1,
+                        self.stuck_after.as_secs_f32().max(1.0)
+                    );
+                    self.shared.queue.abandon(RenderedPage {
+                        request: req,
+                        width: 0,
+                        height: 0,
+                        rgba: Vec::new(),
+                        error: Some(error),
+                        text: None,
+                        millis: 0,
+                    });
+                }
                 let mut left = lock(&self.replacements_left);
                 if *left > 0 && self.spawn_worker() {
                     *left -= 1;
@@ -490,69 +627,503 @@ impl RenderPool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn worker(id: usize, bytes: Arc<Vec<u8>>, config: RenderConfig, shared: Arc<Shared>, wake: Receiver<()>, out: Sender<RenderedPage>) {
+fn worker(id: usize, bytes: Arc<Vec<u8>>, config: RenderConfig, shared: Arc<Shared>, wake: Receiver<()>, out: Arc<WorkQueue>) {
     let settings = config.settings();
-    // Outer loop: (re)build parser + cache; rebuilt after a renderer panic.
+    // A local cell keeps Pdf borrows used by RenderCache stable. Drop both on an
+    // epoch change/panic before publishing an error or taking another request.
     loop {
-        let pdf = parse(&bytes, config.password.as_deref());
-        let cache = RenderCache::new();
-        loop {
-            let next = take_next(&shared);
-            let Some(req) = next else {
-                if wake.recv().is_err() {
-                    return; // pool dropped
-                }
-                continue;
-            };
-            if lock(&shared.stuck).contains(&(req.page, req.kind)) {
-                let error = format!("page {} was skipped earlier because it took too long to render", req.page + 1);
-                let page = RenderedPage { request: req, width: 0, height: 0, rgba: Vec::new(), error: Some(error), text: None, millis: 0 };
-                if out.send(page).is_err() {
-                    return;
-                }
-                continue;
-            }
-            let start = Stopwatch::start();
-            if let Some(slot) = lock(&shared.busy).get_mut(id) {
-                *slot = Some((req, std::time::Instant::now()));
-            }
-            #[cfg(test)]
+        let reset_result =
             {
-                // Copy out first: a guard held in the `if let` would block the other workers.
-                let slow = *lock(&shared.slow_page);
-                if let Some((page, delay)) = slow
-                    && page == req.page
-                {
-                    std::thread::sleep(delay);
+                let parsed = std::cell::OnceCell::new();
+                loop {
+                    if parsed.get().is_some_and(|(_, _, shared_generation)| *shared_generation) && !shared.parser.valid.load(Ordering::Acquire) {
+                        break None;
+                    }
+                    let next = shared.queue.pop();
+                    let Some(req) = next else {
+                        if wake.recv().is_err() {
+                            return; // pool dropped
+                        }
+                        continue;
+                    };
+                    if shared.queue.cancel_obsolete(req) {
+                        continue;
+                    }
+                    if lock(&shared.stuck).contains(&(req.page, req.kind)) {
+                        let error = format!("page {} was skipped earlier because rendering failed or took too long", req.page + 1);
+                        let page = RenderedPage { request: req, width: 0, height: 0, rgba: Vec::new(), error: Some(error), text: None, millis: 0 };
+                        if out.send_valid(page, None).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let start = Stopwatch::start();
+                    let stage = parsed.get().map_or(BusyStage::InitializingShared, |(_, _, shared_generation)| {
+                        if *shared_generation { BusyStage::SharedRender } else { BusyStage::Private }
+                    });
+                    if let Some(slot) = lock(&shared.busy).get_mut(id) {
+                        *slot = Some(Busy { request: req, since: std::time::Instant::now(), stage });
+                    }
+                    let (pdf, cache, shared_generation) = parsed.get_or_init(|| {
+                        let load = || {
+                            #[cfg(test)]
+                            {
+                                shared.parses.fetch_add(1, Ordering::Relaxed);
+                                let delay = *lock(&shared.slow_parse);
+                                if let Some(delay) = delay {
+                                    std::thread::sleep(delay);
+                                }
+                            }
+                            parse(&bytes, config.password.as_deref())
+                        };
+                        match shared.parser.acquire(load, || matches!(wake.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected))) {
+                            Some(pdf) => {
+                                let shared_generation = pdf.is_some();
+                                (pdf, RenderCache::new(), shared_generation)
+                            }
+                            None => {
+                                let pdf = if set_busy_stage(&shared, id, BusyStage::Private) { load().map(Arc::new) } else { None };
+                                (pdf, RenderCache::new(), false)
+                            }
+                        }
+                    });
+                    // Acquisition may have waited or parsed privately after shared
+                    // fallback. Retire before any render work if the watchdog gave
+                    // this request to a replacement while initialization ran.
+                    let stage = if *shared_generation { BusyStage::SharedRender } else { BusyStage::Private };
+                    if !set_busy_stage(&shared, id, stage) {
+                        return;
+                    }
+                    if shared.queue.cancel_obsolete(req) {
+                        if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
+                        if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
+                            return;
+                        }
+                        break Some((finish(req, start, Err(("the shared parser was retired".into(), false))), Some(shared.parser.valid.clone())));
+                    }
+                    #[cfg(test)]
+                    {
+                        shared.render_started.fetch_add(1, Ordering::Relaxed);
+                        let shared_delay = *lock(&shared.shared_render_delay);
+                        if *shared_generation && let Some(delay) = shared_delay {
+                            std::thread::sleep(delay);
+                        }
+                        // Copy out first: a guard held in the `if let` would block the other workers.
+                        let slow = *lock(&shared.slow_page);
+                        if let Some((page, delay)) = slow
+                            && page == req.page
+                        {
+                            std::thread::sleep(delay);
+                        }
+                    }
+                    let r = catch_unwind(AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if *lock(&shared.panic_page) == Some(req.page) {
+                            panic!("injected page panic");
+                        }
+                        match pdf {
+                            Some(pdf) => render_page(pdf, cache, &settings, req),
+                            None => Err(("the document could not be parsed".into(), false)),
+                        }
+                    }))
+                    .unwrap_or_else(|panic| Err((format!("renderer crashed on page {}: {}", req.page + 1, panic_message(&panic)), true)));
+                    // If the watchdog cleared our slot meanwhile, it already answered for this request
+                    // and started a replacement: drop the late result and retire.
+                    let abandoned = lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none());
+                    if abandoned {
+                        return;
+                    }
+                    let panicked = matches!(r, Err((_, true)));
+                    if panicked {
+                        shared.parser.abandon();
+                        lock(&shared.stuck).insert((req.page, req.kind));
+                        break Some((finish(req, start, r), None));
+                    }
+                    let valid = shared_generation.then(|| shared.parser.valid.clone());
+                    if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
+                        break Some((finish(req, start, r), valid));
+                    }
+                    if out.send_valid(finish(req, start, r), valid).is_err() {
+                        return;
+                    }
                 }
-            }
-            let r = match &pdf {
-                Some(pdf) => render_page(pdf, &cache, &settings, req),
-                None => Err(("the document could not be parsed".into(), false)),
-            };
-            // If the watchdog cleared our slot meanwhile, it already answered for this request
-            // and started a replacement: drop the late result and retire.
-            let abandoned = lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none());
-            if abandoned {
-                return;
-            }
-            let panicked = matches!(r, Err((_, true)));
-            if out.send(finish(req, start, r)).is_err() {
-                return;
-            }
-            if panicked {
-                break;
-            }
+            }; // drop the parser and its borrowing cache before delivering reset_result
+        if let Some((page, valid)) = reset_result
+            && out.send_valid(page, valid).is_err()
+        {
+            return;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn receive_before_deadline(pool: &RenderPool) -> RenderedPage {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Some(page) = pool.try_recv() {
+                return page;
+            }
+            assert!(std::time::Instant::now() < deadline, "no worker result");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shared_parser_is_lazy_and_initializes_once_under_contention() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+        let parser = Arc::new(PoolParser::default());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(16));
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+        let jobs: Vec<_> = (0..16)
+            .map(|_| {
+                let (parser, loads, barrier) = (parser.clone(), loads.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    parser
+                        .acquire(
+                            || {
+                                loads.fetch_add(1, Ordering::Relaxed);
+                                Pdf::new(ONE_PAGE.to_vec()).ok()
+                            },
+                            || false,
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect();
+        let pdfs: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert!(pdfs.iter().all(|pdf| Arc::ptr_eq(pdf, &pdfs[0])));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn initializer_panic_publishes_one_failure_and_wakes_waiters() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+        let parser = Arc::new(PoolParser::default());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let (parser, loads, barrier) = (parser.clone(), loads.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(
+                        parser
+                            .acquire(
+                                || {
+                                    loads.fetch_add(1, Ordering::Relaxed);
+                                    panic!("injected parser panic");
+                                },
+                                || false
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                })
+            })
+            .collect();
+        for job in jobs {
+            job.join().unwrap();
+        }
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert!(parser.acquire(|| panic!("must not retry"), || false).unwrap().is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn waiting_worker_can_cancel_before_initializer_returns() {
+        use std::{
+            sync::{atomic::AtomicUsize, mpsc},
+            time::Duration,
+        };
+        let parser = Arc::new(PoolParser::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let initializer = {
+            let parser = parser.clone();
+            std::thread::spawn(move || {
+                parser.acquire(
+                    || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Pdf::new(ONE_PAGE.to_vec()).ok()
+                    },
+                    || false,
+                )
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let (parser, cancelled, checks) = (parser.clone(), cancelled.clone(), checks.clone());
+            std::thread::spawn(move || {
+                let result = parser.acquire(
+                    || panic!("must not initialize twice"),
+                    || {
+                        checks.fetch_add(1, Ordering::Relaxed);
+                        cancelled.load(Ordering::Acquire)
+                    },
+                );
+                done_tx.send(result.unwrap().is_none()).unwrap();
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while checks.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cancelled.store(true, Ordering::Release);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        release_tx.send(()).unwrap();
+        assert!(initializer.join().unwrap().unwrap().is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn page_panic_retires_shared_generation_and_healthy_pages_use_private_parsers() {
+        let pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 3, RenderConfig::default());
+        *lock(&pool.shared.panic_page) = Some(0);
+        *lock(&pool.shared.slow_page) = Some((1, std::time::Duration::from_millis(50)));
+        pool.set_queue(vec![
+            RenderRequest { page: 0, scale: 1.0, ..Default::default() },
+            RenderRequest { page: 1, scale: 1.0, ..Default::default() },
+        ]);
+        let mut pages = [receive_before_deadline(&pool), receive_before_deadline(&pool)];
+        pages.sort_by_key(|page| page.request.page);
+        assert!(pages[0].error.as_deref().is_some_and(|message| message.contains("crashed")));
+        assert!(pages[1].error.is_none(), "{:?}", pages[1].error);
+        assert_eq!((pages[1].width, pages[1].height), (100, 50));
+        assert!(!pool.shared.parser.valid.load(Ordering::Acquire));
+        assert!(matches!(*lock(&pool.shared.parser.state), ParserState::Private));
+        assert!((2..=4).contains(&pool.shared.parses.load(Ordering::Relaxed)));
+        let before = pool.shared.parses.load(Ordering::Relaxed);
+        pool.set_queue(vec![RenderRequest { page: 0, tag: 1, scale: 1.0, ..Default::default() }]);
+        assert!(receive_before_deadline(&pool).error.is_some());
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), before, "a failed page does not trigger repeated parsing");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn results_queued_before_invalidation_are_retried_privately() {
+        let pool = RenderPool::new(Arc::new(ONE_PAGE.to_vec()), 1, RenderConfig::default());
+        pool.set_queue(vec![RenderRequest { tag: 77, scale: 1.0, ..Default::default() }]);
+        let mut old = pool.results.recv_timeout(std::time::Duration::from_secs(8)).unwrap();
+        old.width = 999; // a stale surface must never reach the caller
+        pool.shared.parser.abandon();
+        pool.results_tx.send_valid(old, Some(pool.shared.parser.valid.clone())).unwrap();
+        let page = receive_before_deadline(&pool);
+        assert_eq!((page.width, page.height, page.request.tag), (100, 50, 77));
+        assert!(page.error.is_none());
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn initialization_is_watchdog_accounted_and_not_restarted_after_timeout() {
+        let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
+        pool.set_stuck_after(std::time::Duration::from_millis(50));
+        *lock(&pool.shared.slow_parse) = Some(std::time::Duration::from_secs(1));
+        pool.set_queue(vec![
+            RenderRequest { page: 0, scale: 1.0, ..Default::default() },
+            RenderRequest { page: 1, scale: 1.0, ..Default::default() },
+        ]);
+        let first = receive_before_deadline(&pool);
+        assert!(first.error.is_some());
+        assert!(matches!(*lock(&pool.shared.parser.state), ParserState::Failed));
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
+        // A different request cannot start another copy of the stalled parse.
+        pool.set_queue(vec![RenderRequest { page: 2, tag: 99, scale: 1.0, ..Default::default() }]);
+        loop {
+            let result = receive_before_deadline(&pool);
+            if result.request.tag == 99 {
+                assert!(result.error.as_deref().is_some_and(|e| e.contains("could not be parsed")));
+                break;
+            }
+        }
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn watchdog_retired_private_initializer_never_starts_rendering() {
+        let mut pool = RenderPool::new(Arc::new(ONE_PAGE.to_vec()), 1, RenderConfig::default());
+        // Exercise the permanent private-parser fallback without involving a
+        // second page panic; the separate lifecycle test covers that transition.
+        *lock(&pool.shared.parser.state) = ParserState::Private;
+        pool.shared.parser.valid.store(false, Ordering::Release);
+        *lock(&pool.shared.slow_parse) = Some(std::time::Duration::from_millis(500));
+        *lock(&pool.replacements_left) = 0;
+        pool.set_stuck_after(std::time::Duration::from_millis(25));
+        pool.set_queue(vec![RenderRequest { page: 0, scale: 1.0, ..Default::default() }]);
+        let page = receive_before_deadline(&pool);
+        assert!(page.error.as_deref().is_some_and(|message| message.contains("took longer")));
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
+        // Joining is test-only: this small synthetic initializer has a finite
+        // delay. Wait for its return so a late render cannot escape the assertion.
+        let workers = std::mem::take(&mut *lock(&pool._workers));
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(pool.shared.render_started.load(Ordering::Relaxed), 0);
+        assert!(pool.try_recv().is_none(), "the watchdog result is the only result");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shared_timeouts_retry_healthy_pages_privately_before_blacklisting() {
+        use std::time::Duration;
+        let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
+        pool.set_stuck_after(Duration::from_millis(50));
+        // Both shared workers wait as if behind the same cold decode. Only page0
+        // remains pathological in an independent parser; page1 must recover.
+        *lock(&pool.shared.shared_render_delay) = Some(Duration::from_millis(200));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_millis(400)));
+        pool.set_queue(vec![
+            RenderRequest { page: 0, scale: 1.0, tag: 40, ..Default::default() },
+            RenderRequest { page: 1, scale: 1.0, tag: 41, ..Default::default() },
+        ]);
+        let mut pages = [receive_before_deadline(&pool), receive_before_deadline(&pool)];
+        pages.sort_by_key(|page| page.request.page);
+        assert!(pages[0].error.as_deref().is_some_and(|message| message.contains("took longer")));
+        assert!(pages[1].error.is_none(), "{:?}", pages[1].error);
+        assert_eq!((pages[1].width, pages[1].height, pages[1].request.tag), (100, 50, 41));
+        assert!(lock(&pool.shared.stuck).contains(&(0, RequestKind::Pixels)));
+        assert!(!lock(&pool.shared.stuck).contains(&(1, RequestKind::Pixels)));
+        assert!((2..=3).contains(&pool.shared.parses.load(Ordering::Relaxed)), "one shared parser and one or two reusable private parsers");
+        assert!(lock(&pool._workers).len() <= 4, "the existing replacement cap is unchanged");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn exhausted_private_retry_budget_reports_pending_and_future_requests() {
+        use std::time::Duration;
+        let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
+        pool.set_stuck_after(Duration::from_millis(30));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_millis(300)));
+        let bad = RenderRequest { page: 0, scale: 1.0, tag: 50, ..Default::default() };
+        let healthy = RenderRequest { page: 1, scale: 1.0, tag: 51, ..Default::default() };
+        pool.set_queue(vec![bad, healthy]);
+        let bad_result = receive_before_deadline(&pool);
+        assert_eq!(bad_result.request, bad);
+        assert!(bad_result.error.as_deref().is_some_and(|message| message.contains("took longer")));
+        let exhausted = receive_before_deadline(&pool);
+        assert_eq!(exhausted.request, healthy);
+        assert!(exhausted.error.as_deref().is_some_and(|message| message.contains("all render workers") && message.contains("reopen")));
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 2);
+        assert_eq!(lock(&pool._workers).len(), 2, "no threads beyond the original replacement cap");
+        assert!(!lock(&pool.shared.stuck).contains(&(1, RequestKind::Pixels)), "the healthy page itself is not blacklisted");
+        let later = RenderRequest { tag: 52, ..healthy };
+        pool.set_queue(vec![later]);
+        let result = receive_before_deadline(&pool);
+        assert_eq!(result.request, later);
+        assert!(result.error.as_deref().is_some_and(|message| message.contains("all render workers")));
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 2, "exhaustion performs no parser work on the consumer");
+        let workers = std::mem::take(&mut *lock(&pool._workers));
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(pool.try_recv().is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn replacing_a_request_during_initialization_skips_its_obsolete_render() {
+        use std::time::{Duration, Instant};
+        let pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
+        *lock(&pool.shared.slow_parse) = Some(Duration::from_millis(200));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_secs(2)));
+        pool.set_queue(vec![RenderRequest { page: 0, scale: 1.0, tag: 10, ..Default::default() }]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.shared.parses.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "first request did not start parsing");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let replaced = Instant::now();
+        pool.set_queue(vec![RenderRequest { page: 1, scale: 1.0, tag: 11, ..Default::default() }]);
+        let page = receive_before_deadline(&pool);
+        assert_eq!((page.request.page, page.request.tag), (1, 11));
+        assert!(page.error.is_none(), "{:?}", page.error);
+        assert_eq!((page.width, page.height), (100, 50));
+        assert!(replaced.elapsed() < Duration::from_millis(1500), "obsolete page delayed the replacement request");
+        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1, "the useful parser is retained");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn idle_and_skipped_workers_release_source_without_parsing() {
+        for skipped in [false, true] {
+            let shared = Arc::new(Shared::default());
+            if skipped {
+                let req = RenderRequest { page: 0, ..Default::default() };
+                shared.queue.replace(vec![req]);
+                lock(&shared.stuck).insert((req.page, req.kind));
+            }
+            let bytes = Arc::new(ONE_PAGE.to_vec());
+            let source = Arc::downgrade(&bytes);
+            let (wake_tx, wake_rx) = sync_channel(1);
+            let out = shared.queue.clone();
+            let results = ResultReceiver(shared.queue.clone());
+            // A dropped pool disconnects this channel. Running synchronously makes this check
+            // deterministic even when a worker starts after the pool has already been replaced.
+            drop(wake_tx);
+            worker(0, bytes, RenderConfig::default(), shared.clone(), wake_rx, out);
+            assert_eq!(shared.parses.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(source.upgrade().is_none(), "retired workers release their source bytes");
+            if skipped {
+                assert!(results.try_recv().unwrap().error.as_deref().is_some_and(|e| e.contains("skipped earlier")));
+            }
+            assert!(results.try_recv().is_err());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn worker_reuses_parser_and_releases_source_after_rendering() {
+        let bytes = Arc::new(ONE_PAGE.to_vec());
+        let source = Arc::downgrade(&bytes);
+        let pool = RenderPool::new(bytes, 1, RenderConfig::default());
+        assert!(!pool.is_inline(), "the lifecycle check needs a native worker");
+        for (tag, kind) in [RequestKind::Pixels, RequestKind::Text, RequestKind::Pixels].into_iter().enumerate() {
+            pool.set_queue(vec![RenderRequest { page: 0, kind, scale: 1.0, tag: tag as u64, ..Default::default() }]);
+            let page = pool.results.recv_timeout(std::time::Duration::from_secs(8)).expect("worker result");
+            assert!(page.error.is_none(), "{:?}", page.error);
+            assert_eq!(page.request.tag, tag as u64);
+            match kind {
+                RequestKind::Pixels => assert_eq!((page.width, page.height), (100, 50)),
+                RequestKind::Text => assert!(page.text.is_some()),
+            }
+            assert_eq!(pool.shared.parses.load(std::sync::atomic::Ordering::Relaxed), 1, "requests reuse one parser");
+        }
+        drop(pool);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while source.upgrade().is_some() {
+            assert!(std::time::Instant::now() < until, "dropped pools retire their workers and release the source");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn watchdog_skips_a_stuck_page_and_keeps_rendering() {
         use super::*;
         let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
+        // Exercise the original private-worker replacement guarantee. Shared
+        // contention gets one isolated attempt, covered by the tests above.
+        *lock(&pool.shared.parser.state) = ParserState::Private;
+        pool.shared.parser.valid.store(false, Ordering::Release);
         pool.set_stuck_after(std::time::Duration::from_millis(1000));
         *lock(&pool.shared.slow_page) = Some((0, std::time::Duration::from_secs(4)));
         let req = |page| RenderRequest { page, kind: RequestKind::Pixels, tile: None, scale: 0.5, tag: 0 };
@@ -592,7 +1163,7 @@ mod tests {
         let req = |page| RenderRequest { page, kind: RequestKind::Pixels, tile: None, scale: 0.5, tag: 0 };
         pool.set_queue(vec![req(0)]);
         let t = std::time::Instant::now();
-        while !lock(&pool.shared.busy).iter().flatten().any(|(r, _)| r.page == 0) {
+        while !lock(&pool.shared.busy).iter().flatten().any(|busy| busy.request.page == 0) {
             assert!(t.elapsed() < std::time::Duration::from_secs(8), "page 1 never started");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -613,7 +1184,7 @@ mod tests {
         }
         // Page 2 went to the idle worker instead of waiting behind a second copy of page 1.
         assert_eq!(answers, vec![1, 0]);
-        assert!(lock(&pool.shared.taken).is_empty());
+        assert_eq!(pool.shared.render_started.load(Ordering::Relaxed), 2, "each page rendered once");
     }
 
     #[test]
@@ -655,6 +1226,7 @@ mod tests {
             got[p.request.page] += 1;
         }
         assert_eq!(got, vec![1; pages]);
+        assert_eq!(pool.shared.render_started.load(Ordering::Relaxed), pages, "no duplicated work was hidden by delivery filtering");
     }
 
     #[test]
@@ -690,6 +1262,56 @@ endstream endobj
 5 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 50] /Contents 4 0 R >> endobj
 trailer << /Root 1 0 R >>
 %%EOF";
+
+    #[test]
+    fn large_resource_indexes_preserve_pixels_and_text() {
+        // #307: opening pages used to retain a hash table for every large resource
+        // dictionary on every page, even before rendering. The vendored lazy index
+        // must still resolve late keys, inherited resources and repeated renders.
+        fn fixture(large: bool) -> Vec<u8> {
+            let mut fonts = String::new();
+            let mut forms = String::new();
+            if large {
+                for i in 0..100 {
+                    fonts.push_str(&format!("/UnusedFont{i} 6 0 R "));
+                    forms.push_str(&format!("/UnusedForm{i} 7 0 R "));
+                }
+            }
+            let body = "BT /F1 12 Tf 10 55 Td (Shared resources) Tj ET q 1 0 0 1 10 10 cm /Last Do Q";
+            let form = "0 0 1 rg 0 0 30 20 re f";
+            format!(
+                "%PDF-1.7\n\
+                 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+                 2 0 obj << /Type /Pages /Kids [3 0 R 8 0 R] /Count 2 /MediaBox [0 0 150 100] /Resources 5 0 R >> endobj\n\
+                 3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n\
+                 4 0 obj << /Length {} >> stream\n{body}\nendstream endobj\n\
+                 5 0 obj << /Font << {fonts}/F1 6 0 R >> /XObject << {forms}/Last 7 0 R >> >> endobj\n\
+                 6 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
+                 7 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 30 20] /Length {} >> stream\n{form}\nendstream endobj\n\
+                 8 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources 5 0 R /Rotate 90 >> endobj\n\
+                 trailer << /Root 1 0 R >>\n%%EOF",
+                body.len(),
+                form.len()
+            )
+            .into_bytes()
+        }
+        let mut small = PageRenderer::new(Arc::new(fixture(false)), RenderConfig::default());
+        let mut large = PageRenderer::new(Arc::new(fixture(true)), RenderConfig::default());
+        for page in [0, 1, 0] {
+            for scale in [1.0, 2.0] {
+                let req = RenderRequest { page, scale, ..Default::default() };
+                let (a, b) = (small.render(req), large.render(req));
+                assert!(a.error.is_none() && b.error.is_none());
+                assert_eq!((a.width, a.height, &a.rgba), (b.width, b.height, &b.rgba));
+                assert!(b.rgba.chunks_exact(4).any(|p| p == [0, 0, 255, 255]));
+            }
+            let req = RenderRequest { page, kind: RequestKind::Text, ..Default::default() };
+            let (a, b) = (small.render(req), large.render(req));
+            assert!(a.error.is_none() && b.error.is_none());
+            assert_eq!(a.text.as_ref().unwrap().plain_text(), b.text.as_ref().unwrap().plain_text());
+            assert!(b.text.as_ref().unwrap().plain_text().contains("Shared resources"));
+        }
+    }
 
     #[test]
     fn renders_a_blue_rectangle() {
