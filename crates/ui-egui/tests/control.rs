@@ -486,7 +486,7 @@ fn organize_pages_supports_autoscroll_without_selecting_or_reordering_pages() {
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn middle_button_input_does_not_start_custom_scrolling_outside_linux() {
+fn middle_button_pans_while_held_outside_linux() {
     for organize in [false, true] {
         let (mut h, c) = harness_pages(40);
         h.state_mut().views[0].organize = organize;
@@ -495,8 +495,26 @@ fn middle_button_input_does_not_start_custom_scrolling_outside_linux() {
         ok(&mut h, &c, "ui.click", json!({ "x": p.x, "y": p.y, "button": "middle" }));
         ok(&mut h, &c, "ui.move", json!({ "x": p.x, "y": p.y + 50.0 }));
         h.run_steps(8);
-        assert!(!h.state().views[0].auto_scrolling(), "custom scrolling must be Linux-only: organize={organize}");
+        assert!(!h.state().views[0].auto_scrolling(), "a click does not latch auto-scroll outside Linux: organize={organize}");
+        assert!(!h.state().views[0].middle_panning(), "a released click leaves nothing to pan: organize={organize}");
     }
+    // A drag pans while the button is held, and the Crop tool never sees it.
+    let (mut h, c) = harness();
+    h.state_mut().set_option("zoom", "400").unwrap();
+    h.run_steps(3);
+    h.state_mut().views[0].go_to_page(1);
+    h.run_steps(2);
+    h.state_mut().quick_tool = pdfcraft_ui_egui::QuickTool::Crop;
+    let p = h.state().views[0].viewport_rect().center();
+    let top = h.state().views[0].page_screen_rect(1).unwrap().top();
+    ok(&mut h, &c, "ui.drag", json!({ "from": [p.x, p.y], "to": [p.x, p.y - 60.0], "steps": 12, "button": "middle" }));
+    h.run_steps(2);
+    let moved = h.state().views[0].page_screen_rect(1).unwrap().top();
+    assert!((moved - (top - 60.0)).abs() < 1.0, "the page follows the pointer 1:1: {top} -> {moved}");
+    h.run_steps(8);
+    assert_eq!(h.state().views[0].page_screen_rect(1).unwrap().top(), moved, "no drift after release");
+    assert!(h.state().views[0].crop_drag.is_none(), "the Crop tool must not receive a wheel drag");
+    assert!(!h.state().session.get(h.state().views[0].id).unwrap().dirty);
 }
 
 #[test]

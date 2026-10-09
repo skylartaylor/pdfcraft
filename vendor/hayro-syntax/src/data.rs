@@ -94,7 +94,7 @@ impl Data {
 
     /// Get access to the data of a decoded object stream.
     pub(crate) fn get_with(&self, id: ObjectIdentifier, ctx: &ReaderContext<'_>) -> Option<&[u8]> {
-        // PdfCraft patch: (#307, see vendor/README.md hayro-syntax (7)) register exactly once:
+        // PdfCraft patch: (#307, see vendor/README.md hayro-syntax (10)) register exactly once:
         // racing misses must not allocate different slots
         // for the same id (or reuse the resulting hole for another stream).
         let idx = {
