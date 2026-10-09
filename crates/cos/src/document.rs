@@ -258,7 +258,9 @@ impl Document {
     }
 
     /// Open with a tighter decompression bound for object and cross-reference streams.
-    /// Inspection can use this without changing the editing reader's default limit.
+    /// Inspection can use this without changing the editing reader's default limit. Such a
+    /// document is read-only: objects in a larger object stream read as missing, so the
+    /// writers refuse to save it ([`CosError::ReadOnlyLimit`]).
     pub fn open_with_stream_limit(data: Arc<Vec<u8>>, password: Option<&str>, stream_limit: usize) -> Result<Self, CosError> {
         // Viewers accept files whose header is missing or damaged as long as the body looks
         // like PDF; so do we (a note goes to the repair log).
@@ -640,6 +642,11 @@ impl Document {
             let reference = ObjRef::new(num, reader.document.generation(num));
             (reference, reader.try_get(reference))
         })
+    }
+
+    /// Opened with a tighter stream limit than editing uses ([`Document::open_with_stream_limit`]).
+    pub(crate) fn stream_limited(&self) -> bool {
+        self.stream_limit < crate::object::MAX_DECODED
     }
 
     pub(crate) fn object_reader(&self) -> ObjectReader {
@@ -1344,6 +1351,17 @@ mod tests {
             assert_eq!(doc.objstms.lock().unwrap().len(), streams);
             assert!(Arc::ptr_eq(&doc.cache, &snapshot.cache), "do not detach or clear caller snapshots");
         }
+    }
+
+    #[test]
+    fn a_stream_limited_document_cannot_be_saved() {
+        let bytes = Arc::new(crate::write_full(&Document::new_empty(), &crate::SaveOptions::default()).unwrap());
+        let doc = Document::open_with_stream_limit(bytes.clone(), None, 1 << 20).unwrap();
+        for saved in [crate::write_full(&doc, &crate::SaveOptions::default()), crate::write_incremental(&doc, &crate::SaveOptions::default())] {
+            assert!(matches!(saved, Err(CosError::ReadOnlyLimit)), "{saved:?}");
+        }
+        let doc = Document::open(bytes).unwrap();
+        assert!(crate::write_full(&doc, &crate::SaveOptions::default()).is_ok());
     }
 
     #[test]

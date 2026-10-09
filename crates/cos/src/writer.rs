@@ -177,6 +177,9 @@ enum Row {
 /// incrementally — other readers would follow the broken chain — so it is rewritten in full,
 /// which also repairs the file (what users expect after "the file was damaged and repaired").
 pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosError> {
+    if doc.stream_limited() {
+        return Err(CosError::ReadOnlyLimit);
+    }
     // Reconstructed files have no chain to append to; added or removed encryption must
     // rewrite every object; redaction must not leave the old revision behind. All need a full save.
     if doc.revisions().is_empty() || doc.encryption_changed() || doc.full_save_required() {
@@ -235,6 +238,9 @@ pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, 
 
 /// Write only reachable objects, renumbered from 1, with a table or cross-reference stream.
 pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosError> {
+    if doc.stream_limited() {
+        return Err(CosError::ReadOnlyLimit);
+    }
     // A full traversal must not fill the editor's shared caches (which undo snapshots also
     // own). Parsed objects and decoded object streams are temporary working data here.
     let mut reader = doc.object_reader();

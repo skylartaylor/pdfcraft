@@ -45,4 +45,6 @@ pub enum CosError {
     Security(String),
     #[error("internal lock poisoned")]
     Poisoned,
+    #[error("this document was opened read-only with a decode limit and cannot be saved")]
+    ReadOnlyLimit,
 }
