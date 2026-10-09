@@ -297,9 +297,11 @@ pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BusyStage {
-    InitializingShared,
+    /// Parsing the document, shared or private. Not timed: a huge or damaged file is slow to
+    /// open, not stuck, and giving up on it would fail every page of the pool. (Parsing has
+    /// its own limits.) Rendering is timed from the moment parsing ends.
+    Parsing,
     SharedRender,
-    /// Includes private initialization, which must not escape the watchdog.
     Private,
 }
 
@@ -368,7 +370,8 @@ enum ParserState {
     Ready(Option<Arc<Pdf>>),
     /// A page failed after initialization: isolate subsequent work per worker.
     Private,
-    /// Initial parsing itself timed out. Retrying it on every worker cannot help.
+    /// Retired before it became ready (defensive: parsing is not timed, and only a shared
+    /// render retires the parser). Retrying it on every worker cannot help.
     Failed,
 }
 
@@ -429,14 +432,16 @@ impl PoolParser {
     }
 
     fn abandon(&self) {
-        self.retire(false);
+        self.retire();
     }
 
-    fn retire(&self, initialization_failed: bool) {
+    /// After a shared render failed or timed out: later work parses privately, per worker
+    /// (for the rest of the pool's life: the old one-parser-per-worker memory use). A parser
+    /// that never became ready stays failed.
+    fn retire(&self) {
         let mut state = lock(&self.state);
         self.valid.store(false, Ordering::Release);
         *state = match &*state {
-            _ if initialization_failed => ParserState::Failed,
             ParserState::Loading | ParserState::Empty | ParserState::Failed => ParserState::Failed,
             _ => ParserState::Private,
         };
@@ -550,6 +555,10 @@ impl RenderPool {
 
     /// Replace desired work (most urgent first), retaining matching in-flight/completed jobs.
     /// Obsolete results are released before they reach the caller. In-flight work is not killed.
+    ///
+    /// The contract: a result is delivered only while its request is in the latest queue.
+    /// A caller still waiting for a page (or text, or a thumbnail) must keep listing it in
+    /// every call, or the finished result is dropped to save memory.
     pub fn set_queue(&self, requests: Vec<RenderRequest>) {
         self.shared.queue.replace(requests);
         self.wake_workers();
@@ -606,6 +615,7 @@ impl RenderPool {
                 let stop = lock(&self.shared.stop);
                 for (id, slot) in busy.iter_mut().enumerate() {
                     if let Some(busy) = *slot
+                        && busy.stage != BusyStage::Parsing
                         && busy.since.elapsed() > self.stuck_after
                     {
                         *slot = None; // the worker sees this and exits when it returns
@@ -617,10 +627,13 @@ impl RenderPool {
                     }
                 }
             }
-            *lock(&self.retired_workers) += gave_up.len();
+            {
+                let mut retired = lock(&self.retired_workers);
+                *retired = retired.saturating_add(gave_up.len());
+            }
             for busy in gave_up {
                 let req = busy.request;
-                self.shared.parser.retire(busy.stage == BusyStage::InitializingShared);
+                self.shared.parser.retire();
                 if busy.stage == BusyStage::SharedRender {
                     // The shared cold-decode gate can make a healthy page wait
                     // behind another page. Only its private retry can attribute
@@ -681,128 +694,129 @@ fn worker(
     // A local cell keeps Pdf borrows used by RenderCache stable. Drop both on an
     // epoch change/panic before publishing an error or taking another request.
     loop {
-        let reset_result =
-            {
-                let parsed = std::cell::OnceCell::new();
-                loop {
-                    if parsed.get().is_some_and(|(_, _, shared_generation)| *shared_generation) && !shared.parser.valid.load(Ordering::Acquire) {
-                        break None;
+        let reset_result = {
+            let parsed = std::cell::OnceCell::new();
+            loop {
+                if parsed.get().is_some_and(|(_, _, shared_generation)| *shared_generation) && !shared.parser.valid.load(Ordering::Acquire) {
+                    break None;
+                }
+                let next = shared.queue.pop();
+                let Some(req) = next else {
+                    if wake.recv().is_err() {
+                        return; // pool dropped
                     }
-                    let next = shared.queue.pop();
-                    let Some(req) = next else {
-                        if wake.recv().is_err() {
-                            return; // pool dropped
-                        }
-                        continue;
-                    };
-                    if shared.queue.cancel_obsolete(req) {
-                        continue;
+                    continue;
+                };
+                if shared.queue.cancel_obsolete(req) {
+                    continue;
+                }
+                if lock(&shared.stuck).contains(&(req.page, req.kind)) {
+                    let error = format!("page {} was skipped earlier because rendering failed or took too long", req.page + 1);
+                    let page = RenderedPage { request: req, width: 0, height: 0, rgba: Pixels::default(), error: Some(error), text: None, millis: 0 };
+                    if out.send_valid(page, None).is_err() {
+                        return;
                     }
-                    if lock(&shared.stuck).contains(&(req.page, req.kind)) {
-                        let error = format!("page {} was skipped earlier because rendering failed or took too long", req.page + 1);
-                        let page =
-                            RenderedPage { request: req, width: 0, height: 0, rgba: Pixels::default(), error: Some(error), text: None, millis: 0 };
-                        if out.send_valid(page, None).is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                    let start = Stopwatch::start();
-                    let stage = parsed.get().map_or(BusyStage::InitializingShared, |(_, _, shared_generation)| {
+                    continue;
+                }
+                let start = Stopwatch::start();
+                let stage = parsed.get().map_or(
+                    BusyStage::Parsing,
+                    |(_, _, shared_generation)| {
                         if *shared_generation { BusyStage::SharedRender } else { BusyStage::Private }
-                    });
-                    if let Some(slot) = lock(&shared.busy).get_mut(id) {
-                        *slot = Some(Busy { request: req, since: std::time::Instant::now(), stage });
-                    }
-                    let (pdf, cache, shared_generation) = parsed.get_or_init(|| {
-                        let load = || {
-                            #[cfg(test)]
-                            {
-                                shared.parses.fetch_add(1, Ordering::Relaxed);
-                                let delay = *lock(&shared.slow_parse);
-                                if let Some(delay) = delay {
-                                    std::thread::sleep(delay);
-                                }
-                            }
-                            parse(&bytes, config.password.as_deref())
-                        };
-                        match shared.parser.acquire(load, || matches!(wake.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected))) {
-                            Some(pdf) => {
-                                let shared_generation = pdf.is_some();
-                                (pdf, RenderCache::new(), shared_generation)
-                            }
-                            None => {
-                                let pdf = if set_busy_stage(&shared, id, BusyStage::Private) { load().map(Arc::new) } else { None };
-                                (pdf, RenderCache::new(), false)
-                            }
-                        }
-                    });
-                    // Acquisition may have waited or parsed privately after shared
-                    // fallback. Retire before any render work if the watchdog gave
-                    // this request to a replacement while initialization ran.
-                    let stage = if *shared_generation { BusyStage::SharedRender } else { BusyStage::Private };
-                    if !set_busy_stage(&shared, id, stage) {
-                        return;
-                    }
-                    if shared.queue.cancel_obsolete(req) {
-                        if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
-                            return;
-                        }
-                        continue;
-                    }
-                    if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
-                        if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
-                            return;
-                        }
-                        break Some((finish(req, start, Err(("the shared parser was retired".into(), false))), Some(shared.parser.valid.clone())));
-                    }
-                    #[cfg(test)]
-                    {
-                        shared.render_started.fetch_add(1, Ordering::Relaxed);
-                        let shared_delay = *lock(&shared.shared_render_delay);
-                        if *shared_generation && let Some(delay) = shared_delay {
-                            std::thread::sleep(delay);
-                        }
-                        // Copy out first: a guard held in the `if let` would block the other workers.
-                        let slow = *lock(&shared.slow_page);
-                        if let Some((page, delay)) = slow
-                            && page == req.page
-                        {
-                            std::thread::sleep(delay);
-                        }
-                    }
-                    let r = catch_unwind(AssertUnwindSafe(|| {
+                    },
+                );
+                if let Some(slot) = lock(&shared.busy).get_mut(id) {
+                    *slot = Some(Busy { request: req, since: std::time::Instant::now(), stage });
+                }
+                let (pdf, cache, shared_generation) = parsed.get_or_init(|| {
+                    let load = || {
                         #[cfg(test)]
-                        if *lock(&shared.panic_page) == Some(req.page) {
-                            panic!("injected page panic");
+                        {
+                            shared.parses.fetch_add(1, Ordering::Relaxed);
+                            let delay = *lock(&shared.slow_parse);
+                            if let Some(delay) = delay {
+                                std::thread::sleep(delay);
+                            }
                         }
-                        match pdf {
-                            Some(pdf) => render_page(pdf, cache, &settings, req),
-                            None => Err(("the document could not be parsed".into(), false)),
+                        parse(&bytes, config.password.as_deref())
+                    };
+                    match shared.parser.acquire(load, || matches!(wake.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected))) {
+                        Some(pdf) => {
+                            let shared_generation = pdf.is_some();
+                            (pdf, RenderCache::new(), shared_generation)
                         }
-                    }))
-                    .unwrap_or_else(|panic| Err((format!("renderer crashed on page {}: {}", req.page + 1, panic_message(&panic)), true)));
-                    // If the watchdog cleared our slot meanwhile, it already answered for this request
-                    // and started a replacement: drop the late result and retire.
-                    let abandoned = lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none());
-                    if abandoned {
+                        None => {
+                            let pdf = if set_busy_stage(&shared, id, BusyStage::Parsing) { load().map(Arc::new) } else { None };
+                            (pdf, RenderCache::new(), false)
+                        }
+                    }
+                });
+                // Acquisition may have waited or parsed privately after shared
+                // fallback. Retire before any render work if the watchdog gave
+                // this request to a replacement while initialization ran.
+                let stage = if *shared_generation { BusyStage::SharedRender } else { BusyStage::Private };
+                if !set_busy_stage(&shared, id, stage) {
+                    return;
+                }
+                if shared.queue.cancel_obsolete(req) {
+                    if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
                         return;
                     }
-                    let panicked = matches!(r, Err((_, true)));
-                    if panicked {
-                        shared.parser.abandon();
-                        lock(&shared.stuck).insert((req.page, req.kind));
-                        break Some((finish(req, start, r), None));
-                    }
-                    let valid = shared_generation.then(|| shared.parser.valid.clone());
-                    if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
-                        break Some((finish(req, start, r), valid));
-                    }
-                    if out.send_valid(finish(req, start, r), valid).is_err() {
+                    continue;
+                }
+                if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
+                    if lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none()) {
                         return;
+                    }
+                    break Some((finish(req, start, Err(("the shared parser was retired".into(), false))), Some(shared.parser.valid.clone())));
+                }
+                #[cfg(test)]
+                {
+                    shared.render_started.fetch_add(1, Ordering::Relaxed);
+                    let shared_delay = *lock(&shared.shared_render_delay);
+                    if *shared_generation && let Some(delay) = shared_delay {
+                        std::thread::sleep(delay);
+                    }
+                    // Copy out first: a guard held in the `if let` would block the other workers.
+                    let slow = *lock(&shared.slow_page);
+                    if let Some((page, delay)) = slow
+                        && page == req.page
+                    {
+                        std::thread::sleep(delay);
                     }
                 }
-            }; // drop the parser and its borrowing cache before delivering reset_result
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if *lock(&shared.panic_page) == Some(req.page) {
+                        panic!("injected page panic");
+                    }
+                    match pdf {
+                        Some(pdf) => render_page(pdf, cache, &settings, req),
+                        None => Err(("the document could not be parsed".into(), false)),
+                    }
+                }))
+                .unwrap_or_else(|panic| Err((format!("renderer crashed on page {}: {}", req.page + 1, panic_message(&panic)), true)));
+                // If the watchdog cleared our slot meanwhile, it already answered for this request
+                // and started a replacement: drop the late result and retire.
+                let abandoned = lock(&shared.busy).get_mut(id).is_none_or(|slot| slot.take().is_none());
+                if abandoned {
+                    return;
+                }
+                let panicked = matches!(r, Err((_, true)));
+                if panicked {
+                    shared.parser.abandon();
+                    lock(&shared.stuck).insert((req.page, req.kind));
+                    break Some((finish(req, start, r), None));
+                }
+                let valid = shared_generation.then(|| shared.parser.valid.clone());
+                if *shared_generation && !shared.parser.valid.load(Ordering::Acquire) {
+                    break Some((finish(req, start, r), valid));
+                }
+                if out.send_valid(finish(req, start, r), valid).is_err() {
+                    return;
+                }
+            }
+        }; // drop the parser and its borrowing cache before delivering reset_result
         if let Some((page, valid)) = reset_result
             && out.send_valid(page, valid).is_err()
         {
@@ -815,7 +829,8 @@ fn worker(
 mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn receive_before_deadline(pool: &RenderPool) -> RenderedPage {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // Generous: a loaded CI machine runs many render tests at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Some(page) = pool.try_recv() {
                 return page;
@@ -983,53 +998,48 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn initialization_is_watchdog_accounted_and_not_restarted_after_timeout() {
-        let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
-        pool.set_stuck_after(std::time::Duration::from_millis(50));
-        *lock(&pool.shared.slow_parse) = Some(std::time::Duration::from_secs(1));
-        pool.set_queue(vec![
-            RenderRequest { page: 0, scale: 1.0, ..Default::default() },
-            RenderRequest { page: 1, scale: 1.0, ..Default::default() },
-        ]);
-        let first = receive_before_deadline(&pool);
-        assert!(first.error.is_some());
-        assert!(matches!(*lock(&pool.shared.parser.state), ParserState::Failed));
-        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
-        // A different request cannot start another copy of the stalled parse.
-        pool.set_queue(vec![RenderRequest { page: 2, tag: 99, scale: 1.0, ..Default::default() }]);
-        loop {
-            let result = receive_before_deadline(&pool);
-            if result.request.tag == 99 {
-                assert!(result.error.as_deref().is_some_and(|e| e.contains("could not be parsed")));
-                break;
+    fn a_slow_parse_is_not_a_timeout_and_its_pages_render() {
+        use std::time::{Duration, Instant};
+        // Shared, then the private parsers used after a shared failure.
+        for private in [false, true] {
+            let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
+            if private {
+                *lock(&pool.shared.parser.state) = ParserState::Private;
+                pool.shared.parser.valid.store(false, Ordering::Release);
+            }
+            // The parse takes 2 s against a 10 ms limit: the watchdog must leave it alone.
+            *lock(&pool.shared.slow_parse) = Some(Duration::from_secs(2));
+            pool.set_stuck_after(Duration::from_millis(10));
+            pool.set_queue(vec![
+                RenderRequest { page: 0, scale: 1.0, tag: 60, ..Default::default() },
+                RenderRequest { page: 1, scale: 1.0, tag: 61, ..Default::default() },
+            ]);
+            let started = Instant::now();
+            while pool.shared.parses.load(Ordering::Relaxed) == 0 {
+                assert!(started.elapsed() < Duration::from_secs(5), "parsing did not start");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Run the watchdog well past its limit while the parse is still sleeping.
+            for _ in 0..20 {
+                assert!(pool.try_recv().is_none(), "nothing may be given up on while parsing");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lock(&pool.shared.stuck).is_empty());
+            assert_eq!(*lock(&pool.retired_workers), 0);
+            assert!(!matches!(*lock(&pool.shared.parser.state), ParserState::Failed));
+            // Rendering is timed from the end of parsing: give it a limit it can't miss.
+            pool.set_stuck_after(Duration::from_secs(60));
+            let mut pages = [receive_before_deadline(&pool), receive_before_deadline(&pool)];
+            pages.sort_by_key(|page| page.request.page);
+            for (page, tag) in pages.iter().zip([60, 61]) {
+                assert!(page.error.is_none(), "{:?}", page.error);
+                assert_eq!((page.width, page.height, page.request.tag), (100, 50, tag));
+            }
+            if !private {
+                assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1, "one shared parse");
+                assert!(matches!(*lock(&pool.shared.parser.state), ParserState::Ready(Some(_))));
             }
         }
-        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn watchdog_retired_private_initializer_never_starts_rendering() {
-        let mut pool = RenderPool::new(Arc::new(ONE_PAGE.to_vec()), 1, RenderConfig::default());
-        // Exercise the permanent private-parser fallback without involving a
-        // second page panic; the separate lifecycle test covers that transition.
-        *lock(&pool.shared.parser.state) = ParserState::Private;
-        pool.shared.parser.valid.store(false, Ordering::Release);
-        *lock(&pool.shared.slow_parse) = Some(std::time::Duration::from_millis(500));
-        *lock(&pool.replacements_left) = 0;
-        pool.set_stuck_after(std::time::Duration::from_millis(25));
-        pool.set_queue(vec![RenderRequest { page: 0, scale: 1.0, ..Default::default() }]);
-        let page = receive_before_deadline(&pool);
-        assert!(page.error.as_deref().is_some_and(|message| message.contains("took longer")));
-        assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1);
-        // Joining is test-only: this small synthetic initializer has a finite
-        // delay. Wait for its return so a late render cannot escape the assertion.
-        let workers = std::mem::take(&mut *lock(&pool._workers));
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        assert_eq!(pool.shared.render_started.load(Ordering::Relaxed), 0);
-        assert!(pool.try_recv().is_none(), "the watchdog result is the only result");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1037,11 +1047,13 @@ mod tests {
     fn shared_timeouts_retry_healthy_pages_privately_before_blacklisting() {
         use std::time::Duration;
         let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 2, RenderConfig::default());
-        pool.set_stuck_after(Duration::from_millis(50));
+        // Limits and delays far apart, so a loaded machine can't flip the outcome: a healthy
+        // page renders privately well within 1 s, the injected delays are 3 s and 6 s.
+        pool.set_stuck_after(Duration::from_secs(1));
         // Both shared workers wait as if behind the same cold decode. Only page0
         // remains pathological in an independent parser; page1 must recover.
-        *lock(&pool.shared.shared_render_delay) = Some(Duration::from_millis(200));
-        *lock(&pool.shared.slow_page) = Some((0, Duration::from_millis(400)));
+        *lock(&pool.shared.shared_render_delay) = Some(Duration::from_secs(3));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_secs(6)));
         pool.set_queue(vec![
             RenderRequest { page: 0, scale: 1.0, tag: 40, ..Default::default() },
             RenderRequest { page: 1, scale: 1.0, tag: 41, ..Default::default() },
@@ -1062,8 +1074,8 @@ mod tests {
     fn exhausted_private_retry_budget_reports_pending_and_future_requests() {
         use std::time::Duration;
         let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
-        pool.set_stuck_after(Duration::from_millis(30));
-        *lock(&pool.shared.slow_page) = Some((0, Duration::from_millis(300)));
+        pool.set_stuck_after(Duration::from_millis(300));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_secs(3)));
         let bad = RenderRequest { page: 0, scale: 1.0, tag: 50, ..Default::default() };
         let healthy = RenderRequest { page: 1, scale: 1.0, tag: 51, ..Default::default() };
         pool.set_queue(vec![bad, healthy]);
@@ -1095,7 +1107,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
         *lock(&pool.shared.slow_parse) = Some(Duration::from_millis(200));
-        *lock(&pool.shared.slow_page) = Some((0, Duration::from_secs(2)));
+        *lock(&pool.shared.slow_page) = Some((0, Duration::from_secs(10)));
         pool.set_queue(vec![RenderRequest { page: 0, scale: 1.0, tag: 10, ..Default::default() }]);
         let deadline = Instant::now() + Duration::from_secs(2);
         while pool.shared.parses.load(Ordering::Relaxed) == 0 {
@@ -1108,7 +1120,7 @@ mod tests {
         assert_eq!((page.request.page, page.request.tag), (1, 11));
         assert!(page.error.is_none(), "{:?}", page.error);
         assert_eq!((page.width, page.height), (100, 50));
-        assert!(replaced.elapsed() < Duration::from_millis(1500), "obsolete page delayed the replacement request");
+        assert!(replaced.elapsed() < Duration::from_secs(8), "obsolete page (10 s) delayed the replacement request");
         assert_eq!(pool.shared.parses.load(Ordering::Relaxed), 1, "the useful parser is retained");
     }
 
@@ -1839,6 +1851,10 @@ trailer << /Root 1 0 R >>
     #[test]
     fn the_watchdog_stops_the_render_it_gives_up_on() {
         let mut pool = RenderPool::new(Arc::new(ONE_PAGE_TWICE.to_vec()), 1, RenderConfig::default());
+        // Private parsers: a shared render's first timeout is retried privately, which would
+        // give up on (and stop) a second worker too.
+        *lock(&pool.shared.parser.state) = ParserState::Private;
+        pool.shared.parser.valid.store(false, Ordering::Release);
         pool.set_stuck_after(std::time::Duration::from_millis(100));
         *lock(&pool.shared.slow_page) = Some((0, std::time::Duration::from_millis(1500)));
         pool.set_queue(vec![RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 0.5, tag: 0 }]);
@@ -1847,7 +1863,7 @@ trailer << /Root 1 0 R >>
             if let Some(p) = pool.try_recv() {
                 break p;
             }
-            assert!(t.elapsed() < std::time::Duration::from_secs(8), "no answer");
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "no answer");
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert!(first.error.as_deref().is_some_and(|e| e.contains("took longer")), "{:?}", first.error);
